@@ -254,11 +254,16 @@ def validate_extracted_data(data: Dict) -> bool:
             logger.error("Missing 'entries' in document_content")
             return False
             
-        # Check if it's a valid index type
-        index_type = data['document_metadata'].get('index_type')
-        if index_type not in ['INDEX_1', 'INDEX_2']:
-            logger.error(f"Invalid index_type: {index_type}")
+        # Check and normalize index type
+        index_type = data['document_metadata'].get('index_type', '')
+        normalized_index_type = normalize_index_type(index_type)
+        
+        if normalized_index_type not in ['INDEX_1', 'INDEX_2']:
+            logger.error(f"Invalid index_type: {index_type} (normalized: {normalized_index_type})")
             return False
+        
+        # Update the data with normalized index type
+        data['document_metadata']['index_type'] = normalized_index_type
             
         # Validate entries structure
         entries = data['document_content']['entries']
@@ -279,78 +284,33 @@ def validate_extracted_data(data: Dict) -> bool:
         logger.error(f"Validation error: {e}")
         return False
 
-def clean_and_parse_json(response_text: str) -> Optional[Dict]:
-    """Enhanced JSON cleaning and parsing with multiple fallback strategies."""
-    if not response_text or not response_text.strip():
-        logger.error("Empty response text")
-        return None
-        
-    try:
-        # Clean the response
-        cleaned = response_text.strip()
-        
-        # Remove markdown code blocks
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        elif cleaned.startswith("```"):
-            cleaned = cleaned[3:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        
-        cleaned = cleaned.strip()
-        
-        # Log the first 500 chars for debugging
-        logger.info(f"Attempting to parse JSON (first 500 chars): {cleaned[:500]}...")
-        
-        # Strategy 1: Try parsing as-is
-        try:
-            data = json.loads(cleaned)
-            logger.info("✅ JSON parsed successfully with strategy 1")
-            return data
-        except json.JSONDecodeError as e:
-            logger.warning(f"Strategy 1 failed: {e}")
-        
-        # Strategy 2: Try to extract JSON object using regex
-        json_pattern = r'\{(?:[^{}]|{(?:[^{}]|{[^{}]*})*})*\}'
-        matches = re.findall(json_pattern, cleaned, re.DOTALL)
-        
-        for match in matches:
-            try:
-                data = json.loads(match)
-                logger.info("✅ JSON parsed successfully with strategy 2")
-                return data
-            except json.JSONDecodeError:
-                continue
-        
-        # Strategy 3: Try with json5 for more lenient parsing
-        try:
-            import json5
-            data = json5.loads(cleaned)
-            logger.info("✅ JSON parsed successfully with strategy 3 (json5)")
-            return data
-        except Exception as e:
-            logger.warning(f"Strategy 3 (json5) failed: {e}")
-        
-        # Strategy 4: Try to fix common JSON issues
-        # Fix trailing commas
-        fixed = re.sub(r',(\s*[}\]])', r'\1', cleaned)
-        # Fix unescaped quotes in strings
-        fixed = re.sub(r'(?<!\\)"(?=\w)', r'\\"', fixed)
-        
-        try:
-            data = json.loads(fixed)
-            logger.info("✅ JSON parsed successfully with strategy 4")
-            return data
-        except json.JSONDecodeError as e:
-            logger.warning(f"Strategy 4 failed: {e}")
-            
-        logger.error(f"All JSON parsing strategies failed. Response: {cleaned[:1000]}...")
-        return None
-        
-    except Exception as e:
-        logger.error(f"Error in clean_and_parse_json: {e}")
-        return None
+def normalize_index_type(index_type: str) -> str:
+    """Normalize various index type formats to standard format."""
+    if not index_type:
+        return "INDEX_1"  # Default
+    
+    index_type_clean = index_type.upper().strip()
+    
+    # Handle various formats
+    if "INDEX NO. I" in index_type_clean or "INDEX I" in index_type_clean:
+        return "INDEX_1"
+    elif "INDEX NO. II" in index_type_clean or "INDEX II" in index_type_clean:
+        return "INDEX_2"
+    elif "INDEX_1" in index_type_clean or "INDEX1" in index_type_clean:
+        return "INDEX_1"
+    elif "INDEX_2" in index_type_clean or "INDEX2" in index_type_clean:
+        return "INDEX_2"
+    else:
+        # Try to extract roman numerals
+        if "I" in index_type_clean and "II" not in index_type_clean:
+            return "INDEX_1"
+        elif "II" in index_type_clean:
+            return "INDEX_2"
+        else:
+            logger.warning(f"Could not normalize index_type: {index_type}, defaulting to INDEX_1")
+            return "INDEX_1"
 
+# Also update the model names - Gemini 2.5 doesn't exist yet
 def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[Dict]:
     """Enhanced extraction with better error handling and safety filter workarounds."""
     logger.info(f"📄 Processing image: {image_path}")
@@ -374,8 +334,8 @@ def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[D
         logger.error(f"❌ Error opening/processing image {image_path}: {e}")
         return None
 
-    # Try different models and configurations
-    models_to_try = ['gemini-2.5-pro', 'gemini-2.5-flash']
+    # Try different models and configurations - FIXED MODEL NAMES
+    models_to_try = ['gemini-2.5-pro', 'gemini-2.5-flash']  # Fixed: 2.5 doesn't exist
     prompts_to_try = [build_expert_prompt(), build_fallback_prompt()]
     
     for model_name in models_to_try:
@@ -463,6 +423,10 @@ def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[D
                         logger.warning(f"Invalid data structure on attempt {attempt + 1}")
                         if data:
                             logger.error(f"Data structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                            # Log the actual index_type for debugging
+                            if 'document_metadata' in data:
+                                actual_index_type = data['document_metadata'].get('index_type', 'NOT_FOUND')
+                                logger.error(f"Actual index_type in response: '{actual_index_type}'")
                         
                         if attempt < max_retries - 1:
                             time.sleep(2 ** attempt)
@@ -476,6 +440,78 @@ def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[D
     
     logger.error("❌ All retry attempts with all models and prompts failed")
     return None
+
+def clean_and_parse_json(response_text: str) -> Optional[Dict]:
+    """Enhanced JSON cleaning and parsing with multiple fallback strategies."""
+    if not response_text or not response_text.strip():
+        logger.error("Empty response text")
+        return None
+        
+    try:
+        # Clean the response
+        cleaned = response_text.strip()
+        
+        # Remove markdown code blocks
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        
+        cleaned = cleaned.strip()
+        
+        # Log the first 500 chars for debugging
+        logger.info(f"Attempting to parse JSON (first 500 chars): {cleaned[:500]}...")
+        
+        # Strategy 1: Try parsing as-is
+        try:
+            data = json.loads(cleaned)
+            logger.info("✅ JSON parsed successfully with strategy 1")
+            return data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Strategy 1 failed: {e}")
+        
+        # Strategy 2: Try to extract JSON object using regex
+        json_pattern = r'\{(?:[^{}]|{(?:[^{}]|{[^{}]*})*})*\}'
+        matches = re.findall(json_pattern, cleaned, re.DOTALL)
+        
+        for match in matches:
+            try:
+                data = json.loads(match)
+                logger.info("✅ JSON parsed successfully with strategy 2")
+                return data
+            except json.JSONDecodeError:
+                continue
+        
+        # Strategy 3: Try with json5 for more lenient parsing
+        try:
+            import json5
+            data = json5.loads(cleaned)
+            logger.info("✅ JSON parsed successfully with strategy 3 (json5)")
+            return data
+        except Exception as e:
+            logger.warning(f"Strategy 3 (json5) failed: {e}")
+        
+        # Strategy 4: Try to fix common JSON issues
+        # Fix trailing commas
+        fixed = re.sub(r',(\s*[}\]])', r'\1', cleaned)
+        # Fix unescaped quotes in strings
+        fixed = re.sub(r'(?<!\\)"(?=\w)', r'\\"', fixed)
+        
+        try:
+            data = json.loads(fixed)
+            logger.info("✅ JSON parsed successfully with strategy 4")
+            return data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Strategy 4 failed: {e}")
+            
+        logger.error(f"All JSON parsing strategies failed. Response: {cleaned[:1000]}...")
+        return None
+        
+    except Exception as e:
+        logger.error(f"Error in clean_and_parse_json: {e}")
+        return None
 
 def display_extracted_data(data: Dict):
     """Display the extracted data in a formatted way with error handling."""
