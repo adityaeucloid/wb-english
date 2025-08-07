@@ -367,8 +367,7 @@ def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[D
                     
                     response = model.generate_content(
                         [prompt, image],
-                        generation_config=generation_config,
-                        safety_settings=safety_settings
+                        generation_config=generation_config
                     )
                     
                     # Enhanced response validation
