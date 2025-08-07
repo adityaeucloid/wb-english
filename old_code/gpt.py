@@ -1,7 +1,8 @@
 import os
 import json
 import time
-import google.generativeai as genai
+import base64
+from openai import OpenAI
 from PIL import Image
 import pandas as pd
 from dotenv import load_dotenv
@@ -15,12 +16,13 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 load_dotenv()
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in .env file. Please create a .env file.")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env file. Please create a .env file.")
 
-genai.configure(api_key=GOOGLE_API_KEY)
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 def build_expert_prompt() -> str:
     """
@@ -178,66 +180,21 @@ def build_expert_prompt() -> str:
     ```
 
     CRITICAL INSTRUCTIONS:
-    1. This is a historical administrative document for academic research purposes
-    2. Return ONLY the JSON object. No markdown backticks or additional text.
-    3. When you see ditto marks, copy the value from the corresponding field in the entry above
-    4. Apply geographical spell-checking for all place names
-    5. Be aggressive in interpreting poor handwriting using context
-    6. Always fill confidence_notes with any corrections or assumptions made
-    7. Use your expertise to interpret unclear handwriting based on context and common names/places
+    1. Return ONLY the JSON object. No markdown backticks or additional text.
+    2. When you see ditto marks, copy the value from the corresponding field in the entry above
+    3. Apply geographical spell-checking for all place names
+    4. Be aggressive in interpreting poor handwriting using context
+    5. Always fill confidence_notes with any corrections or assumptions made
     """
 
-def build_fallback_prompt() -> str:
-    """Simplified prompt for safety filter issues."""
-    return """
-    Extract information from this historical administrative document image for academic research purposes.
-
-    This is a West Bengal government registration index from the 1960s. Look for:
-    - Serial numbers
-    - Names of persons or properties
-    - Registration locations
-    - Volume and page numbers
-    - Any additional identifying information
-
-    Return as JSON:
-
-    {
-      "document_metadata": {
-        "document_type": "Registration Index",
-        "index_type": "INDEX_1",
-        "form_number": "Unknown",
-        "office_location": "Unknown", 
-        "year": "Unknown",
-        "page_number_on_document": "Unknown",
-        "extraction_confidence": "medium"
-      },
-      "document_content": {
-        "entries": [
-          {
-            "serial_number": "number",
-            "entry_details": {
-              "name_of_person": "person name",
-              "additional_information": "details",
-              "interest_of_person_in_transaction": "role",
-              "where_registered": "location",
-              "book_1_volume": "volume",
-              "book_1_page": "page"
-            },
-            "confidence_notes": ["notes"]
-          }
-        ]
-      },
-      "extraction_notes": {
-        "unclear_sections": [],
-        "missing_information": [],
-        "interpretation_assumptions": [],
-        "ditto_resolutions": [],
-        "spelling_corrections": []
-      }
-    }
-
-    Return only valid JSON.
-    """
+def encode_image_to_base64(image_path: str) -> str:
+    """Encode image to base64 string for OpenAI API."""
+    try:
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    except Exception as e:
+        logger.error(f"Error encoding image to base64: {e}")
+        raise
 
 def validate_extracted_data(data: Dict) -> bool:
     """Validate the structure of extracted data."""
@@ -351,9 +308,9 @@ def clean_and_parse_json(response_text: str) -> Optional[Dict]:
         logger.error(f"Error in clean_and_parse_json: {e}")
         return None
 
-def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[Dict]:
-    """Enhanced extraction with better error handling and safety filter workarounds."""
-    logger.info(f"📄 Processing image: {image_path}")
+def extract_data_from_image_gpt(image_path: str, max_retries: int = 3) -> Optional[Dict]:
+    """Enhanced extraction with OpenAI GPT-4 Vision."""
+    logger.info(f"📄 Processing image with GPT-4: {image_path}")
     
     # Validate image file exists and is readable
     if not os.path.exists(image_path):
@@ -369,115 +326,132 @@ def extract_data_from_image(image_path: str, max_retries: int = 3) -> Optional[D
         # Convert to RGB if needed
         if image.mode != 'RGB':
             image = image.convert('RGB')
+            # Save as JPEG for better compatibility
+            temp_path = image_path.replace(os.path.splitext(image_path)[1], '_temp.jpg')
+            image.save(temp_path, 'JPEG')
+            image_path = temp_path
             
     except Exception as e:
         logger.error(f"❌ Error opening/processing image {image_path}: {e}")
         return None
 
-    # Try different models and configurations
-    models_to_try = ['gemini-2.5-pro', 'gemini-2.5-flash']
-    prompts_to_try = [build_expert_prompt(), build_fallback_prompt()]
+    # Encode image to base64
+    try:
+        base64_image = encode_image_to_base64(image_path)
+    except Exception as e:
+        logger.error(f"❌ Error encoding image: {e}")
+        return None
+
+    prompt = build_expert_prompt()
     
-    for model_name in models_to_try:
-        model = genai.GenerativeModel(model_name)
-        logger.info(f"🤖 Trying model: {model_name}")
-        
-        for prompt_idx, prompt in enumerate(prompts_to_try):
-            logger.info(f"📝 Using prompt strategy {prompt_idx + 1}")
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"🤖 GPT-4 API call attempt {attempt + 1}/{max_retries}")
             
-            for attempt in range(max_retries):
-                try:
-                    logger.info(f"🤖 API call attempt {attempt + 1}/{max_retries}")
+            response = client.chat.completions.create(
+                model="gpt-4o",  # Updated to the latest GPT-4 Vision model
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}",
+                                    "detail": "high"
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=4096,
+                temperature=0.1
+            )
+            
+            if not response.choices:
+                logger.warning(f"No choices in response on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error("No choices returned in final attempt")
+                    return None
+            
+            choice = response.choices[0]
+            finish_reason = choice.finish_reason
+            
+            logger.info(f"Response finish_reason: {finish_reason}")
+            
+            if finish_reason not in ['stop', 'length']:
+                logger.warning(f"Unusual finish_reason: {finish_reason}")
+                if finish_reason == 'content_filter':
+                    logger.error("Response blocked by content filter")
+                
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return None
+            
+            content = choice.message.content
+            if not content:
+                logger.warning(f"Empty content on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    logger.error("Empty content in final attempt")
+                    return None
+            
+            # Clean and parse JSON
+            data = clean_and_parse_json(content)
+            
+            if data and validate_extracted_data(data):
+                doc_type = data.get('document_metadata', {}).get('index_type', 'UNKNOWN')
+                entries_count = len(data.get('document_content', {}).get('entries', []))
+                logger.info(f"✅ Successfully extracted {entries_count} entries from {doc_type} document with GPT-4")
+                return data
+            else:
+                logger.warning(f"Invalid data structure on attempt {attempt + 1}")
+                if data:
+                    logger.error(f"Data structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                     
-                    # More permissive generation config
-                    generation_config = genai.types.GenerationConfig(
-                        temperature=0.1,
-                        max_output_tokens=8192,
-                        response_mime_type="application/json",
-                        candidate_count=1
-                    )
-                    
-                    # Most permissive safety settings
-                    safety_settings = [
-                        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-                    ]
-                    
-                    response = model.generate_content(
-                        [prompt, image],
-                        generation_config=generation_config,
-                        safety_settings=safety_settings
-                    )
-                    
-                    # Enhanced response validation
-                    if not response.candidates:
-                        logger.warning(f"No candidates in response on attempt {attempt + 1}")
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                        else:
-                            logger.error("No candidates returned in final attempt")
-                            break
-                    
-                    candidate = response.candidates[0]
-                    finish_reason = candidate.finish_reason
-                    
-                    logger.info(f"Response finish_reason: {finish_reason}")
-                    
-                    if finish_reason == 2:  # SAFETY
-                        logger.warning("Response blocked by safety filters, trying next strategy...")
-                        break  # Try next prompt/model
-                    elif finish_reason != 1:  # 1 = STOP (normal completion)
-                        logger.warning(f"Unusual finish_reason: {finish_reason}")
-                        if finish_reason == 3:  # RECITATION
-                            logger.error("Response blocked due to recitation")
-                        elif finish_reason == 4:  # OTHER
-                            logger.error("Response blocked for other reasons")
-                        
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                        else:
-                            break
-                    
-                    if not hasattr(response, 'text') or not response.text:
-                        logger.warning(f"Empty response.text on attempt {attempt + 1}")
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                        else:
-                            logger.error("Empty response in final attempt")
-                            break
-                    
-                    # Clean and parse JSON
-                    data = clean_and_parse_json(response.text)
-                    
-                    if data and validate_extracted_data(data):
-                        doc_type = data.get('document_metadata', {}).get('index_type', 'UNKNOWN')
-                        entries_count = len(data.get('document_content', {}).get('entries', []))
-                        logger.info(f"✅ Successfully extracted {entries_count} entries from {doc_type} document using {model_name}")
-                        return data
-                    else:
-                        logger.warning(f"Invalid data structure on attempt {attempt + 1}")
-                        if data:
-                            logger.error(f"Data structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                        
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
-                            
-                except Exception as e:
-                    logger.error(f"❌ Error on attempt {attempt + 1}: {e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)
-                        continue
+        except Exception as e:
+            # Handle different types of OpenAI errors
+            error_msg = str(e)
+            if "rate limit" in error_msg.lower():
+                logger.warning(f"Rate limit exceeded on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(60)  # Wait 1 minute for rate limit
+                    continue
+                else:
+                    logger.error("Rate limit exceeded in final attempt")
+                    return None
+            elif "api" in error_msg.lower():
+                logger.error(f"OpenAI API error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                else:
+                    return None
+            else:
+                logger.error(f"❌ Error on attempt {attempt + 1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
     
-    logger.error("❌ All retry attempts with all models and prompts failed")
+    logger.error("❌ All retry attempts failed")
     return None
 
-def display_extracted_data(data: Dict):
+def display_extracted_data_gpt(data: Dict):
     """Display the extracted data in a formatted way with error handling."""
     if not data:
         logger.warning("No data to display")
@@ -489,7 +463,7 @@ def display_extracted_data(data: Dict):
         notes = data.get('extraction_notes', {})
         
         print("\n" + "="*80)
-        print("📋 EXTRACTED DATA SUMMARY")
+        print("📋 EXTRACTED DATA SUMMARY (GPT-4)")
         print("="*80)
         print(f"📄 Document Type: {metadata.get('document_type', 'Unknown')}")
         print(f"📊 Index Type: {metadata.get('index_type', 'Unknown')}")
@@ -530,7 +504,7 @@ def display_extracted_data(data: Dict):
     except Exception as e:
         logger.error(f"Error displaying data: {e}")
 
-def save_entries_to_excel(data: Dict, excel_path: str) -> bool:
+def save_entries_to_excel_gpt(data: Dict, excel_path: str) -> bool:
     """Save extracted entries to Excel with error handling."""
     try:
         entries = data.get('document_content', {}).get('entries', [])
@@ -561,15 +535,15 @@ def main():
     """Main function with robust error handling."""
     try:
         image_path = "Index I/INDEX_I_&II,_1960_&_1950[1]_pages-to-jpg-0006.jpg"
-        output_path = "extracted_data.json"
+        output_path = "extracted_data_gpt.json"
 
-        print("🚀 West Bengal Index Document Processor")
+        print("🚀 West Bengal Index Document Processor (GPT-4)")
         print("="*80)
 
-        extracted_data = extract_data_from_image(image_path)
+        extracted_data = extract_data_from_image_gpt(image_path)
 
         if extracted_data:
-            display_extracted_data(extracted_data)
+            display_extracted_data_gpt(extracted_data)
             
             try:
                 json_output = json.dumps(extracted_data, indent=2, ensure_ascii=False)
@@ -579,8 +553,8 @@ def main():
             except IOError as e:
                 logger.error(f"❌ Error saving JSON file: {e}")
             
-            excel_path = "extracted_data.xlsx"
-            save_entries_to_excel(extracted_data, excel_path)
+            excel_path = "extracted_data_gpt.xlsx"
+            save_entries_to_excel_gpt(extracted_data, excel_path)
         else:
             logger.error("❌ No data was extracted. Please check the image and try again.")
             
