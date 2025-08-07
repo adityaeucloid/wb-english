@@ -1,0 +1,10 @@
+google-generativeai
+pillow
+opencv-python
+numpy
+requests
+pillow
+pydantic
+python-dotenv
+pandas
+openpyxl
